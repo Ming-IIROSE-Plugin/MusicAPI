@@ -1,6 +1,7 @@
 """只读检查指定云函数；不打印配置原文、环境值或代码下载链接。"""
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -48,6 +49,15 @@ def inspect_archive(client):
     if len(archive) > 50 * 1024 * 1024:
         emit("package", {"inspection": "size-limit"})
         return
+    emit(
+        "package_hash",
+        {
+            "sha256_hex": hashlib.sha256(archive).hexdigest(),
+            "sha256_base64": __import__("base64")
+            .b64encode(hashlib.sha256(archive).digest())
+            .decode("ascii"),
+        },
+    )
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         names = set(bundle.namelist())
         result = {
