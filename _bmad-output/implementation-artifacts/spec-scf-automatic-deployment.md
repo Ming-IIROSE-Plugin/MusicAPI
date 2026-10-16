@@ -73,6 +73,10 @@ context:
 
 ## Implementation Notes
 
+实际 GitHub 验证（2026-10-16）：提交 8234ab3 的运行 38961253145 完成，Node 24 构建/lint、45 项应用测试、23 项 Python 测试、生产 ZIP 打包及解包启动测试全部通过。云端只读预检确认目标、运行时、挂载、别名和 HTTP 触发器匹配；部署门控关闭，updated=false。运行 38961253462 进一步确认旧包 .env 中存在 MUSIC_U、REFRESH_COOKIE_NETEASE、DEBUG_NETEASE，而云端环境变量不存在这些项；只输出存在性，未保存或输出值。已将目标公网 origin 配置到仓库变量 SCF_HEALTH_URL；首次 CI 在设置前启动，因此健康 URL 条件需下次重验。
+
+当前交付状态：CI/CD 实现与云端只读调查完成，首次生产更新尚未执行。剩余操作为将旧 .env 的三项配置迁移到 SCF 环境变量，确认迁移后设置 SCF_CONFIG_MIGRATED=true、SCF_DEPLOY_ENABLED=true，再执行首次部署验收。状态保留 in-progress，不能把绿色 CI 解释为已更新生产。
+
 2026-10-16 用户完成 GitHub workflow 授权，明确允许通过 Actions 查询腾讯云。只读检查运行 38958158656 成功：Runtime=Nodejs24.11、Type=HTTP、Status=Active、Timeout=3、InitTimeout=65、MemorySize=512、挂载 /mnt/、公网启用且配置 VPC。http 触发器绑定 $DEFAULT，别名指向 $LATEST 且无权重分流。ZIP 内有 dist/index.js、package.json、node_modules、可执行 scf_bootstrap，启动二进制 /var/lang/node24/bin/node。ZIP 中有 .env，但不读取输出其值。两个腾讯云 Secrets 已存在且鉴权成功。
 
 用户已授权搭建现有函数的自动化及默认提交推送；据此先完成可逆的流水线、打包和只读预检查。仅代码部署在环境来源解决且开启 SCF_DEPLOY_ENABLED 后触发；不猜测删除现有 .env 不会影响业务，不复制凭证到产物。
