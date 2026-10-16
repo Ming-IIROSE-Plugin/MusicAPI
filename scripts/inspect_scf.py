@@ -32,6 +32,16 @@ def request(client, action, extra=None):
 
 def inspect_archive(client):
     data = request(client, "GetFunctionAddress")
+    code_hash = data.get("CodeSha256")
+    if isinstance(code_hash, str):
+        emit(
+            "code_hash",
+            {
+                "value": code_hash.lower()
+                if re.fullmatch(r"[A-Fa-f0-9]{64}", code_hash)
+                else code_hash
+            },
+        )
     # 代码包仅在内存中检查，无解压、无上传产物、无打印签名 URL。
     with urllib.request.urlopen(data["Url"], timeout=30) as response:
         archive = response.read(50 * 1024 * 1024 + 1)
