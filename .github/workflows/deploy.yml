@@ -1,0 +1,87 @@
+name: Validate and deploy MusicAPI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "eslint.config.mjs"
+      - "test/**"
+      - "scripts/package_scf.py"
+      - "scripts/deploy_scf.py"
+      - "scripts/smoke_scf.py"
+      - "scf_bootstrap"
+      - "requirements-scf.txt"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: musicapi-scf-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: mkdir -p /tmp/opencode
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - run: python3 -m unittest discover -s test -p 'test_*.py'
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-scf.txt
+      - run: python3 scripts/package_scf.py --output "$RUNNER_TEMP/musicapi-scf.zip"
+        env:
+          TMPDIR: /tmp/opencode
+      - name: Test extracted production package with isolated fixtures
+        run: python3 scripts/smoke_scf.py --package "$RUNNER_TEMP/musicapi-scf.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: musicapi-scf-package
+          path: ${{ runner.temp }}/musicapi-scf.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-scf.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: musicapi-scf-package
+          path: ${{ runner.temp }}
+      - name: Read-only preflight or gated code update
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          SCF_DEPLOY_ENABLED: ${{ vars.SCF_DEPLOY_ENABLED || 'false' }}
+          SCF_CONFIG_MIGRATED: ${{ vars.SCF_CONFIG_MIGRATED || 'false' }}
+          SCF_HEALTH_URL: ${{ vars.SCF_HEALTH_URL || '' }}
+          SCF_HEALTH_TRUSTED_ORIGIN: ${{ vars.SCF_HEALTH_TRUSTED_ORIGIN || '' }}
+        run: python3 scripts/deploy_scf.py --package "$RUNNER_TEMP/musicapi-scf.zip"

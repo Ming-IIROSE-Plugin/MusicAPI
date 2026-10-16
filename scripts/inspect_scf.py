@@ -53,6 +53,23 @@ def inspect_archive(client):
         result["node_modules_present"] = any(
             n.startswith("node_modules/") for n in names
         )
+        if ".env" in names and bundle.getinfo(".env").file_size < 65536:
+            text = bundle.read(".env").decode("utf-8", errors="replace")
+            emit(
+                "packaged_environment_presence",
+                {
+                    name: bool(
+                        re.search(r"(?m)^\s*(?:export\s+)?" + name + r"\s*=\s*\S", text)
+                    )
+                    for name in (
+                        "MUSIC_U",
+                        "REFRESH_COOKIE_NETEASE",
+                        "DEBUG_NETEASE",
+                        "NETEASE_COOKIE_FILE",
+                        "PORT",
+                    )
+                },
+            )
         if "scf_bootstrap" in names:
             info = bundle.getinfo("scf_bootstrap")
             result["bootstrap_executable"] = bool((info.external_attr >> 16) & 0o111)
@@ -153,6 +170,35 @@ def main():
                     collection,
                     [{key: item.get(key) for key in fields} for item in items],
                 )
+                if action == "ListTriggers":
+                    for item in items:
+                        try:
+                            desc = json.loads(item.get("TriggerDesc") or "{}")
+                        except (ValueError, TypeError):
+                            continue
+                        # 只输出公开端点的 origin，不输出查询参数或鉴权配置。
+                        from urllib.parse import urlsplit
+
+                        urls = []
+
+                        def collect(value):
+                            if isinstance(value, dict):
+                                for entry in value.values():
+                                    collect(entry)
+                            elif isinstance(value, list):
+                                for entry in value:
+                                    collect(entry)
+                            elif isinstance(value, str) and value.startswith(
+                                "https://"
+                            ):
+                                parsed = urlsplit(value)
+                                if parsed.hostname and parsed.hostname.endswith(
+                                    ".tencentscf.com"
+                                ):
+                                    urls.append("https://" + parsed.hostname)
+
+                        collect(desc)
+                        emit("function_url_origins", sorted(set(urls)))
                 if len(items) < 100:
                     break
                 offset += len(items)

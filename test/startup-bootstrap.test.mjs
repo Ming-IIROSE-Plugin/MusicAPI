@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const distEntry = path.join(root, "dist", "index.js");
+const distEntry = process.env.MUSICAPI_TEST_DIST_ENTRY
+  ? path.resolve(process.env.MUSICAPI_TEST_DIST_ENTRY)
+  : path.join(root, "dist", "index.js");
 const token = "process-token";
 const dotenvToken = "dotenv-token";
 
@@ -156,6 +158,7 @@ globalThis.fetch = async (url, options = {}) => {
     );
     const rootResponse = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(rootResponse.status, 200);
+    assert.equal(await rootResponse.text(), "Music Redirect Server Running");
     if (checkMusicRoute) {
       const musicResponse = await fetch(
         `http://127.0.0.1:${port}/musicstreamlink?platform=netease&id=1&quality=higher`,
