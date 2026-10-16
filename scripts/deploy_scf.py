@@ -247,7 +247,17 @@ def wait_for_code(
     latest: dict[str, Any] = {}
     while time.monotonic() <= deadline:
         latest = read_api(client, "GetFunction", {"ShowCode": "FALSE"}, call)
-        current_hash = code_hash(client, call)
+        try:
+            current_hash = code_hash(client, call)
+        except Exception as error:
+            # SCF 更新接受后，下载地址可能尚未生成；仅在总等待预算内重试。
+            if error_code(error) != "FailedOperation.GetFunctionAddress":
+                raise
+            current_hash = None
+            emit(
+                "readiness",
+                {"status": latest.get("Status"), "code_address_pending": True},
+            )
         if latest.get("Status") == "Active" and current_hash in expected_hashes:
             emit("readiness", {"status": "Active", "code_hash_matched": True})
             return latest

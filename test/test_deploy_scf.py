@@ -290,6 +290,30 @@ class DeploymentTests(unittest.TestCase):
                 deploy.read_api(None, "GetFunction", {}, client.call)
             self.assertEqual(api.call_count, 3)
 
+    def test_wait_tolerates_pending_code_address_after_update(self):
+        class PendingAddress(Exception):
+            def get_code(self):
+                return "FailedOperation.GetFunctionAddress"
+
+        responses = valid_responses()
+        attempts = 0
+
+        def address():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise PendingAddress("must-not-log-signed-url")
+            return {"CodeSha256": "1" * 64}
+
+        responses["GetFunctionAddress"] = address
+        client = FakeClient(responses)
+        output = io.StringIO()
+        with patch.object(deploy.time, "sleep"), redirect_stdout(output):
+            deploy.wait_for_code(client, {"1" * 64}, client.call)
+        self.assertEqual(attempts, 4)
+        self.assertNotIn("must-not-log", output.getvalue())
+        self.assertNotIn("UpdateFunctionCode", [name for name, _ in client.calls])
+
     def test_bad_health_and_oversize_prevent_update(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "bundle.zip"
