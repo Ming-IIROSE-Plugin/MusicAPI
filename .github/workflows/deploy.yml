@@ -52,7 +52,7 @@ jobs:
           TMPDIR: /tmp/opencode
       - name: Test extracted production package with isolated fixtures
         run: python3 scripts/smoke_scf.py --package "$RUNNER_TEMP/musicapi-scf.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: musicapi-scf-package
           path: ${{ runner.temp }}/musicapi-scf.zip
@@ -72,7 +72,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 -m pip install --disable-pip-version-check -r requirements-scf.txt
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: musicapi-scf-package
           path: ${{ runner.temp }}
