@@ -3,6 +3,7 @@ import { existsSync } from "fs";
 import path from "path";
 import http from "http";
 import https from "https";
+import { safeErrorFields } from "../config/env.js";
 
 const BASE_DATA_PATH = existsSync("/mnt")
   ? "/mnt"
@@ -102,8 +103,12 @@ export async function setMusicCache(
     };
 
     await fs.writeFile(filePath, JSON.stringify(cacheData), "utf-8");
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[Cache Error] ${message}`);
+  } catch (error: unknown) {
+    const fields = safeErrorFields(error);
+    console.error(
+      `[Cache Error] errorCategory=${fields.errorCategory}${
+        fields.errno !== undefined ? ` errno=${fields.errno}` : ""
+      }${fields.errorCode !== undefined ? ` errorCode=${fields.errorCode}` : ""}`,
+    );
   }
 }

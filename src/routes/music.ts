@@ -2,6 +2,7 @@ import { Router } from "./router.js";
 import { fetchMusicUrl } from "../service/musicService.js";
 import { getMusicCache, setMusicCache } from "../service/cacheService.js";
 import { sendError } from "../utils/response.js";
+import { logDiagnostic, safeErrorFields } from "../config/env.js";
 
 let getIp: () => string = () => "0.0.0.0";
 
@@ -9,6 +10,7 @@ export function initMusicRoute(ipGetter: () => string): void {
   getIp = ipGetter;
 
   Router.get("/musicstreamlink", async (req, res, url) => {
+    const startedAt = Date.now();
     const platform = url.searchParams.get("platform");
 
     const id = url.searchParams.get("id");
@@ -69,10 +71,15 @@ export function initMusicRoute(ipGetter: () => string): void {
 
       res.end();
     } catch (error: unknown) {
+      logDiagnostic("music-route", {
+        result: "request-error",
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
+      });
       sendError(res, 500, {
         error: "Internal Error",
-        message: error instanceof Error ? error.message : "Unknown Error",
-        cause: error instanceof Error ? error.cause : undefined,
+        message: "Request failed",
+        cause: safeErrorFields(error),
       });
 
       return;

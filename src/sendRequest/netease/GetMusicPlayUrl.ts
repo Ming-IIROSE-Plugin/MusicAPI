@@ -1,6 +1,7 @@
 import { CookieManager } from "../../accountManage/netease/CookieManager.js";
 import { SendRequest } from "../index.js";
 import { NeteaseCrypto } from "./NeteaseCrypto.js";
+import { logDiagnostic, safeErrorFields } from "../../config/env.js";
 
 export class GetMusicPlayUrl extends SendRequest {
   // 辅助方法：从 Cookie 中提取特定字段
@@ -21,6 +22,7 @@ export class GetMusicPlayUrl extends SendRequest {
     level: string = "higher",
     ip: string,
   ): Promise<string> {
+    const startedAt = Date.now();
     void level;
     // 1. 尝试获取本地 Cookie
     const currentCookie = (await CookieManager.getCookie(ip)) || "";
@@ -87,52 +89,91 @@ export class GetMusicPlayUrl extends SendRequest {
       "X-Forwarded-For": ip,
     };
 
-    const response = await this.sendPost(
-      url,
-      new URLSearchParams(body),
-      headers,
-      undefined,
-    );
-    if (!response.ok) {
-      throw new Error(`获取 URL 失败，HTTP 状态码: ${response.status}`, {
-        cause: {
-          status: response.status,
-          statusText: response.statusText,
-          url: response.url,
-        },
+    let response: Response;
+    try {
+      response = await this.sendPost(
+        url,
+        new URLSearchParams(body),
+        headers,
+        undefined,
+      );
+    } catch (error: unknown) {
+      logDiagnostic("play-url", {
+        result: "network-error",
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
       });
+      throw new Error("获取 URL 请求失败");
     }
-    const responseData = await response.json();
+    if (!response.ok) {
+      logDiagnostic("play-url", {
+        result: "http-error",
+        httpStatus: response.status,
+        elapsedMs: Date.now() - startedAt,
+      });
+      throw new Error(`获取 URL 失败，HTTP 状态码: ${response.status}`);
+    }
+    let responseData: unknown;
+    try {
+      responseData = await response.json();
+    } catch {
+      logDiagnostic("play-url", {
+        result: "invalid-json",
+        httpStatus: response.status,
+        elapsedMs: Date.now() - startedAt,
+      });
+      throw new Error("获取 URL 响应无效");
+    }
     // 7. 解析返回结果
     if (
-      responseData.code === 200 &&
-      responseData.data &&
-      responseData.data.length > 0
+      responseData &&
+      typeof responseData === "object" &&
+      (responseData as { code?: unknown }).code === 200 &&
+      Array.isArray((responseData as { data?: unknown }).data) &&
+      (responseData as { data: unknown[] }).data.length > 0
     ) {
-      const songData = responseData.data[0];
+      const songData = (responseData as { data: unknown[] }).data[0];
 
-      if (songData.url) {
-        console.log(`成功获取歌曲链接 (音质: ${songData.br} bps)`);
-        return songData.url;
+      if (
+        songData &&
+        typeof songData === "object" &&
+        typeof (songData as { url?: unknown }).url === "string" &&
+        (songData as { url: string }).url.length > 0
+      ) {
+        const bitrate = (songData as { br?: unknown }).br;
+        logDiagnostic("play-url", {
+          result: "success",
+          businessCode: 200,
+          bitrate:
+            typeof bitrate === "number" && Number.isFinite(bitrate)
+              ? bitrate
+              : undefined,
+          elapsedMs: Date.now() - startedAt,
+        });
+        console.log("成功获取歌曲链接");
+        return (songData as { url: string }).url;
       } else {
-        // 如果 url 为 null，通常是因为无版权或需要 VIP 且当前账号无权限
-        // console.error('获取成功，但网易云未返回有效播放链接 (可能需要 VIP 或无版权):', songData);
-        throw new Error(
-          `获取成功，但网易云未返回有效播放链接 (可能需要 VIP 或无版权).`,
-          {
-            cause: {
-              songData,
-            },
-          },
-        );
+        logDiagnostic("play-url", {
+          result: "missing-url",
+          businessCode: 200,
+          elapsedMs: Date.now() - startedAt,
+        });
+        throw new Error("获取成功但没有可用播放链接");
       }
     } else {
-      console.error("获取 URL 失败，服务器返回:", responseData);
-      throw new Error(`获取 URL 失败`, {
-        cause: {
-          responseData,
-        },
+      const businessCode =
+        responseData &&
+        typeof responseData === "object" &&
+        typeof (responseData as { code?: unknown }).code === "number" &&
+        Number.isFinite((responseData as { code: number }).code)
+          ? (responseData as { code: number }).code
+          : undefined;
+      logDiagnostic("play-url", {
+        result: "business-error",
+        businessCode,
+        elapsedMs: Date.now() - startedAt,
       });
+      throw new Error("获取 URL 失败");
     }
   }
 }

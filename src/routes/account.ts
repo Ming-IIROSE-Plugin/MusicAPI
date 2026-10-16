@@ -1,6 +1,7 @@
 import { Router } from "./router.js";
 import { sendError } from "../utils/response.js";
 import { AccountManager } from "../accountManage/netease/AccountManager.js";
+import { safeErrorFields } from "../config/env.js";
 
 let getIp: () => string = () => "0.0.0.0";
 
@@ -19,8 +20,8 @@ export function initAccountRoute(ipGetter: () => string): void {
     } catch (error: unknown) {
       sendError(res, 500, {
         error: "Internal Error",
-        message: error instanceof Error ? error.message : "Unknown Error",
-        cause: error instanceof Error ? error.cause : undefined,
+        message: "Request failed",
+        cause: safeErrorFields(error),
       });
 
       return;

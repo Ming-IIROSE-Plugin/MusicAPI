@@ -23,6 +23,7 @@ fs.writeFileSync(".env", "MUSIC_U=env-token\nREFRESH_COOKIE_NETEASE=false\n");
 // 只转译这些测试的依赖闭包；不依赖已有 dist，也不执行全项目构建。
 const sources = [
   "accountManage/netease/CookieManager",
+  "config/env",
   "accountManage/netease/AccountManager",
   "sendRequest/netease/neteaseAccount",
   "sendRequest/netease/NeteaseCrypto",
@@ -55,6 +56,8 @@ const { AccountManager } = await load("accountManage/netease/AccountManager");
 const { NeteaseAccount } = await load("sendRequest/netease/neteaseAccount");
 const { NeteaseCrypto } = await load("sendRequest/netease/NeteaseCrypto");
 const { GetMusicPlayUrl } = await load("sendRequest/netease/GetMusicPlayUrl");
+const { safeErrorFields, resolvePort, logConfigDiagnostics } =
+  await load("config/env");
 
 const originalTarget = CookieManager.getTargetFilePath;
 let fixture;
@@ -122,6 +125,7 @@ beforeEach(() => {
   fixture = path.join(workspace, `fixture-${crypto.randomUUID()}.json`);
   CookieManager.getTargetFilePath = () => fixture;
   process.env.MUSIC_U = "env-token";
+  process.env.DEBUG_NETEASE = "false";
 });
 afterEach(() => {
   assert.equal(CookieManager.refreshPromise, null);
@@ -286,7 +290,8 @@ test("并发手动/直接刷新共享延迟旧账号检查，读取等待新会�
   const calls = transport(t, async (call) => {
     if (isRefresh(call)) {
       assert.equal(call.cookie.MUSIC_U, "env-token");
-      assert.equal(call.cookie.NMTID, "old-nmtid");
+      assert.equal(call.cookie.__csrf, undefined);
+      assert.equal(call.cookie.NMTID, undefined);
       return refreshResponse();
     }
     if (call.cookie.MUSIC_U === "old-token") {
@@ -317,6 +322,230 @@ test("并发手动/直接刷新共享延迟旧账号检查，读取等待新会�
   assert.equal(oldChecks, 1);
   assert.equal(calls.filter(isRefresh).length, 1);
   assert.equal(calls.length, 3);
+});
+
+test("读取等待失败中的刷新后不重复发起刷新", async (t) => {
+  seed("MUSIC_U=old-token");
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const calls = transport(t, async (call) => {
+    assert.equal(isRefresh(call), true);
+    await blocked;
+    throw Object.assign(new Error("fixture network"), { code: "ENOTFOUND" });
+  });
+  const refreshing = CookieManager.initialize(ip, true);
+  await Promise.resolve();
+  const reading = CookieManager.getCookie(ip);
+  release();
+  assert.equal((await refreshing).success, false);
+  assert.equal(await reading, "MUSIC_U=old-token");
+  assert.equal(calls.filter(isRefresh).length, 1);
+});
+
+test("错误诊断只保留允许的分类、系统码和有限 cause", () => {
+  const result = safeErrorFields({
+    name: "secret-name",
+    code: "secret-code",
+    errno: "secret-errno",
+    cause: {
+      name: "TypeError",
+      code: "ENOTFOUND",
+      errno: -3008,
+      cause: { name: "CustomSecret", code: "another-secret" },
+    },
+  });
+  assert.deepEqual(result, {
+    errorCategory: "network-error",
+    errorCode: "ENOTFOUND",
+    errno: -3008,
+  });
+  assert.deepEqual(
+    safeErrorFields({ name: "secret", code: "secret", errno: Infinity }),
+    { errorCategory: "unknown" },
+  );
+  const cycle = { name: "secret", cause: null };
+  cycle.cause = cycle;
+  assert.deepEqual(safeErrorFields(cycle), { errorCategory: "unknown" });
+  assert.deepEqual(
+    safeErrorFields(
+      new TypeError("secret", { cause: { code: "ECONNREFUSED", errno: -111 } }),
+    ),
+    {
+      errorCategory: "network-error",
+      errorCode: "ECONNREFUSED",
+      errno: -111,
+    },
+  );
+});
+
+test("端口只接受范围内的纯数字，包括动态端口 0", (t) => {
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  logConfigDiagnostics(fixture, resolvePort("secret-port"));
+  assert.match(logs.join("\n"), /invalid config; defaulted/);
+  assert.doesNotMatch(logs.join("\n"), /secret-port/);
+  for (const value of [
+    "9000junk",
+    "65536",
+    "99999999999999999999",
+    "-1",
+    " 9000",
+    "",
+    "1.5",
+  ]) {
+    assert.deepEqual(resolvePort(value), { port: 9000, invalid: true });
+  }
+  for (const value of ["0", "9000", "65535"]) {
+    assert.deepEqual(resolvePort(value), {
+      port: Number(value),
+      invalid: false,
+    });
+  }
+});
+
+test("环境 token 与持久 token 相同也按实际分支记录来源", async (t) => {
+  seed();
+  process.env.MUSIC_U = "old-token";
+  process.env.DEBUG_NETEASE = "true";
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  const calls = successTransport(t);
+  assert.equal(await CookieManager.refreshCookie(ip), true);
+  assert.equal(calls.find(isRefresh).cookie.__csrf, "old-csrf");
+  assert.match(logs.join("\n"), /candidate=persisted/);
+  assert.doesNotMatch(logs.join("\n"), /candidate=env/);
+});
+
+test("账号请求诊断区分 HTTP、业务和 JSON 响应", async (t) => {
+  process.env.DEBUG_NETEASE = "true";
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  const cases = [
+    [
+      "http-business",
+      json({ code: 401, message: "secret-body" }, 503),
+      "http-error",
+      503,
+      401,
+    ],
+    ["http", new Response("{}", { status: 503 }), "http-error", 503, undefined],
+    ["json", new Response("invalid"), "invalid-json", 200, undefined],
+    ["business", json({ code: 503 }), "business-error", 200, 503],
+    ["shape", json({ code: 200 }), "malformed-response", 200, 200],
+  ];
+  let currentResponse;
+  t.mock.method(NeteaseAccount, "sendPost", async () => currentResponse);
+  for (const [, response, category, status, businessCode] of cases) {
+    currentResponse = response;
+    await assert.rejects(
+      NeteaseAccount.getAccountInfo("csrf", "token", ip, "MUSIC_U=token"),
+      (error) => {
+        const fields = safeErrorFields(error);
+        assert.equal(fields.errorCategory, category);
+        assert.equal(fields.httpStatus, status);
+        assert.equal(fields.businessCode, businessCode);
+        return true;
+      },
+    );
+    assert.match(logs.at(-1), /phase=account-request.*elapsedMs=\d+/);
+    assert.doesNotMatch(logs.at(-1), /secret-body/);
+  }
+});
+
+test("Cookie 文件诊断区分缺失、JSON、结构和保存阶段失败", async (t) => {
+  process.env.DEBUG_NETEASE = "true";
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  assert.equal(CookieManager.getCookieData(), null);
+  fs.writeFileSync(fixture, "invalid");
+  assert.equal(CookieManager.getCookieData(), null);
+  fs.writeFileSync(fixture, JSON.stringify({ cookie: 1, date: "bad" }));
+  assert.equal(CookieManager.getCookieData(), null);
+  const originalOpen = fs.openSync;
+  t.mock.method(fs, "openSync", () => {
+    throw Object.assign(new Error("fixture io"), { code: "EACCES" });
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(CookieManager.setCookie(oldCookie), false);
+  } finally {
+    fs.openSync = originalOpen;
+    syncBuiltinESMExports();
+  }
+  assert.match(logs.join("\n"), /result=missing/);
+  assert.match(logs.join("\n"), /result=invalid-json/);
+  assert.match(logs.join("\n"), /result=invalid-shape/);
+  assert.match(logs.join("\n"), /phase=cookie-save/);
+  assert.match(logs.join("\n"), /operation=open/);
+  assert.match(logs.join("\n"), /errorCode=EACCES/);
+  assert.doesNotMatch(logs.join("\n"), /fixture io|old-token/);
+});
+
+test("Cookie 读取 I/O 错误保留 errno，null JSON 是结构错误", (t) => {
+  process.env.DEBUG_NETEASE = "true";
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  fs.writeFileSync(fixture, "null");
+  assert.equal(CookieManager.getCookieData(), null);
+  const originalRead = fs.readFileSync;
+  t.mock.method(fs, "readFileSync", () => {
+    throw Object.assign(new Error("secret-file"), {
+      code: "EACCES",
+      errno: -13,
+    });
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(CookieManager.getCookieData(), null);
+  } finally {
+    fs.readFileSync = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.match(logs.join("\n"), /result=invalid-shape/);
+  assert.match(
+    logs.join("\n"),
+    /result=io-error.*errno=-13.*errorCode=EACCES|result=io-error.*errorCode=EACCES.*errno=-13/,
+  );
+  assert.doesNotMatch(logs.join("\n"), /secret-file/);
+});
+
+test("播放日志覆盖网络、JSON、空地址和恶意 br，不输出原文", async (t) => {
+  process.env.DEBUG_NETEASE = "true";
+  const logs = [];
+  t.mock.method(console, "log", (...args) => logs.push(args.join(" ")));
+  t.mock.method(CookieManager, "getCookie", async () => oldCookie);
+  let response;
+  t.mock.method(globalThis, "fetch", async () => {
+    if (response instanceof Error) throw response;
+    return response;
+  });
+  for (const [value, reason] of [
+    [
+      new TypeError("secret-error", { cause: { code: "ENOTFOUND" } }),
+      "network-error",
+    ],
+    [new Response("secret-json"), "invalid-json"],
+    [
+      json({ code: 200, data: [{ url: null, br: "secret-br" }] }),
+      "missing-url",
+    ],
+    [json({ code: "secret-code" }), "business-error"],
+  ]) {
+    response = value;
+    await assert.rejects(GetMusicPlayUrl.getUrl("1", "higher", ip));
+    assert.match(logs.at(-1), new RegExp(`result=${reason}.*elapsedMs=\\d+`));
+  }
+  response = json({
+    code: 200,
+    data: [{ url: "https://audio.invalid/secret-audio", br: "secret-br" }],
+  });
+  assert.equal(
+    await GetMusicPlayUrl.getUrl("1", "higher", ip),
+    "https://audio.invalid/secret-audio",
+  );
+  assert.doesNotMatch(logs.join("\n"), /secret-|old-token|old-csrf/);
 });
 
 test("真实传输方法保留 Cookie/设备/IP/超时和 EAPI token", async (t) => {
@@ -445,19 +674,21 @@ test("原子重命名失败保留精确旧字节并清理临时文件", async (t
 });
 
 for (const cookie of [undefined, "MUSIC_U=only-token", "__csrf=only-csrf"]) {
-  test(`缺失或不完整会话不伪造成功：${cookie ?? "missing"}`, async () => {
+  test(`缺失或不完整会话使用环境 token 尝试刷新：${cookie ?? "missing"}`, async (t) => {
     if (cookie) seed(cookie);
     const before = cookie ? readBytes() : null;
+    const calls = successTransport(t);
     const result = await CookieManager.checkAndRefreshCookie(ip);
-    assert.equal(result.status, "NEEDS_SESSION_IMPORT");
-    assert.equal(result.refreshed, false);
-    assert.equal(await CookieManager.getCookie(ip), cookie ?? null);
-    assert.equal(
-      (await AccountManager.checkAccountStatus(ip)).status,
-      "Needs session import",
-    );
-    if (before) assert.deepEqual(readBytes(), before);
-    else assert.equal(fs.existsSync(fixture), false);
+    assert.equal(result.status, "REFRESHED");
+    assert.equal(result.refreshed, true);
+    const refreshes = calls.filter(isRefresh);
+    assert.equal(refreshes.length, 1);
+    assert.equal(refreshes[0].cookie.MUSIC_U, "env-token");
+    assert.equal(refreshes[0].cookie.__csrf, undefined);
+    assert.equal(refreshes[0].cookie.NMTID, undefined);
+    assert.match(await CookieManager.getCookie(ip), /MUSIC_U=rotated-token/);
+    if (before) assert.notDeepEqual(readBytes(), before);
+    else assert.ok(fs.existsSync(fixture));
   });
 }
 

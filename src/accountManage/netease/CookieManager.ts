@@ -1,14 +1,16 @@
 import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
-import dotenv from "dotenv";
 import { env } from "process";
 import {
   classifyAccount,
   NeteaseAccount,
 } from "../../sendRequest/netease/neteaseAccount.js";
-
-dotenv.config();
+import {
+  getCookieFilePath,
+  logDiagnostic,
+  safeErrorFields,
+} from "../../config/env.js";
 
 interface CookieData {
   cookie: string;
@@ -54,6 +56,8 @@ export class CookieManager {
   private static refreshPromise: Promise<RefreshResult> | null = null;
 
   private static getTargetFilePath(): string {
+    const configuredFile = getCookieFilePath();
+    if (configuredFile) return configuredFile;
     const mntDir = path.join("/mnt", "account", "netease");
     const localDir = path.join(process.cwd(), "data", "account", "netease");
     const targetDir = fs.existsSync(mntDir) ? mntDir : localDir;
@@ -195,7 +199,18 @@ export class CookieManager {
     );
   }
 
+  private static logSelection(
+    reason: "missing" | "incomplete" | "invalid" | "alive" | "unavailable",
+    source: "persisted" | "env" | "none",
+    action: "refresh" | "skip" | "preserve" | "import" | "login",
+  ): void {
+    console.log(
+      `> [CookieManager] 会话选择 reason=${reason}, source=${source}, action=${action}`,
+    );
+  }
+
   public static setCookie(cookie: string): boolean {
+    const startedAt = Date.now();
     const targetFile = this.getTargetFilePath();
     const targetDir = path.dirname(targetFile);
     const tempFile = `${targetFile}.${process.pid}.${Date.now()}.tmp`;
@@ -204,16 +219,23 @@ export class CookieManager {
       date: Date.now(),
     };
 
+    let operation = "mkdir";
     try {
       fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+      operation = "open";
       const fileDescriptor = fs.openSync(tempFile, "w", 0o600);
       try {
+        operation = "write";
         fs.writeFileSync(fileDescriptor, JSON.stringify(dataToSave, null, 2));
+        operation = "file-fsync";
         fs.fsyncSync(fileDescriptor);
+        operation = "close";
       } finally {
         fs.closeSync(fileDescriptor);
       }
+      operation = "rename";
       fs.renameSync(tempFile, targetFile);
+      operation = "directory-fsync";
       try {
         const directoryDescriptor = fs.openSync(targetDir, "r");
         try {
@@ -221,13 +243,30 @@ export class CookieManager {
         } finally {
           fs.closeSync(directoryDescriptor);
         }
-      } catch {
+      } catch (error: unknown) {
         // 文件已经原子替换；部分文件系统不支持目录 fsync，不影响本次保存结果。
+        logDiagnostic("cookie-save", {
+          result: "directory-fsync-skipped",
+          operation,
+          elapsedMs: Date.now() - startedAt,
+          ...safeErrorFields(error),
+        });
       }
       console.log("> [CookieManager] Cookie 已原子保存。");
+      logDiagnostic("cookie-save", {
+        result: "success",
+        operation,
+        elapsedMs: Date.now() - startedAt,
+      });
       return true;
-    } catch {
+    } catch (error: unknown) {
       console.error("> [CookieManager] Cookie 原子保存失败。");
+      logDiagnostic("cookie-save", {
+        result: "failure",
+        operation,
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
+      });
       try {
         fs.unlinkSync(tempFile);
       } catch {
@@ -238,23 +277,63 @@ export class CookieManager {
   }
 
   public static getCookieData(): CookieData | null {
+    const startedAt = Date.now();
     const targetFile = this.getTargetFilePath();
     try {
-      if (!fs.existsSync(targetFile)) return null;
-      const parsedData = JSON.parse(
-        fs.readFileSync(targetFile, "utf-8"),
-      ) as Partial<CookieData>;
+      let raw: string;
+      try {
+        raw = fs.readFileSync(targetFile, "utf-8");
+      } catch (error: unknown) {
+        logDiagnostic("cookie-read", {
+          result:
+            safeErrorFields(error).errorCode === "ENOENT"
+              ? "missing"
+              : "io-error",
+          elapsedMs: Date.now() - startedAt,
+          ...safeErrorFields(error),
+        });
+        return null;
+      }
+      let parsedData: Partial<CookieData>;
+      try {
+        parsedData = JSON.parse(raw) as Partial<CookieData>;
+      } catch {
+        logDiagnostic("cookie-read", {
+          result: "invalid-json",
+          elapsedMs: Date.now() - startedAt,
+        });
+        return null;
+      }
       if (
+        !parsedData ||
+        typeof parsedData !== "object" ||
         typeof parsedData.cookie !== "string" ||
         typeof parsedData.date !== "number" ||
         !Number.isFinite(parsedData.date)
       ) {
+        logDiagnostic("cookie-read", {
+          result: "invalid-shape",
+          elapsedMs: Date.now() - startedAt,
+        });
         return null;
       }
+      logDiagnostic("cookie-read", {
+        result: "valid",
+        elapsedMs: Date.now() - startedAt,
+      });
       return { cookie: parsedData.cookie, date: parsedData.date };
-    } catch {
+    } catch (error: unknown) {
+      logDiagnostic("cookie-read", {
+        result: "io-error",
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
+      });
       return null;
     }
+  }
+
+  public static getCookieStoragePath(): string {
+    return this.getTargetFilePath();
   }
 
   public static getCookieHeader(): string {
@@ -262,14 +341,15 @@ export class CookieManager {
   }
 
   public static async getCookie(ip = "127.0.0.1"): Promise<string | null> {
-    if (this.refreshPromise) await this.refreshPromise;
+    const hadActiveRefresh = Boolean(this.refreshPromise);
+    if (hadActiveRefresh) await this.refreshPromise;
     const cookieData = this.getCookieData();
     const cookie = cookieData?.cookie || "";
     const hasRequiredFields =
       Boolean(this.getCookieValueFromString(cookie, "MUSIC_U")) &&
       Boolean(this.getCookieValueFromString(cookie, "__csrf"));
 
-    if (!cookieData || !hasRequiredFields) {
+    if (!hadActiveRefresh && (!cookieData || !hasRequiredFields)) {
       await this.refreshCookie(ip);
     }
 
@@ -289,9 +369,18 @@ export class CookieManager {
     cookie: string,
     ip: string,
   ): Promise<AccountCheckResult> {
+    const startedAt = Date.now();
     const musicU = this.getCookieValueFromString(cookie, "MUSIC_U");
     const csrf = this.getCookieValueFromString(cookie, "__csrf");
-    if (!musicU || !csrf) return { state: "incomplete" };
+    if (!musicU || !csrf) {
+      logDiagnostic("account-check", {
+        result: "incomplete",
+        musicU: musicU ? "present" : "missing",
+        csrf: csrf ? "present" : "missing",
+        elapsedMs: Date.now() - startedAt,
+      });
+      return { state: "incomplete" };
+    }
 
     try {
       const data = await NeteaseAccount.getAccountInfo(
@@ -300,9 +389,21 @@ export class CookieManager {
         ip,
         this.normalizeCookie(cookie),
       );
+      logDiagnostic("account-check", {
+        result: classifyAccount(data),
+        businessCode: data.code,
+        musicU: "present",
+        csrf: "present",
+        elapsedMs: Date.now() - startedAt,
+      });
       return { state: classifyAccount(data), code: data.code };
-    } catch {
+    } catch (error: unknown) {
       // 网络、HTTP 或 JSON 异常不能触发环境凭证兜底。
+      logDiagnostic("account-check", {
+        result: "unavailable",
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
+      });
       return { state: "unavailable" };
     }
   }
@@ -329,7 +430,9 @@ export class CookieManager {
 
     let candidateCookie = persistedCookie;
     let candidateMusicU = persistedMusicU;
+    let candidateSource: "persisted" | "env" = "persisted";
     const persistedStatus = await this.checkAccount(persistedCookie, ip);
+    const selectionReason = !cookieData ? "missing" : persistedStatus.state;
 
     const age = cookieData ? Date.now() - cookieData.date : Infinity;
     const oneDayMs = 24 * 60 * 60 * 1000;
@@ -340,6 +443,7 @@ export class CookieManager {
       age < oneDayMs
     ) {
       const totalMinutes = Math.floor((oneDayMs - age) / (1000 * 60));
+      this.logSelection("alive", "persisted", "skip");
       const hours = Math.floor(totalMinutes / 60);
       const minutes = totalMinutes % 60;
       return {
@@ -352,30 +456,43 @@ export class CookieManager {
     }
 
     if (persistedStatus.state === "unavailable") {
+      this.logSelection(selectionReason, "persisted", "preserve");
       return this.result(
         "ACCOUNT_CHECK_UNAVAILABLE",
         "账号校验网络异常，保留当前会话。",
       );
     }
 
-    if (persistedStatus.state === "incomplete") {
-      return this.result(
-        "NEEDS_SESSION_IMPORT",
-        "当前 Cookie 缺少 MUSIC_U 或 __csrf，需要导入完整会话。",
-      );
-    }
-
-    if (persistedStatus.state === "invalid") {
+    if (
+      persistedStatus.state === "incomplete" ||
+      persistedStatus.state === "invalid"
+    ) {
       if (!envMusicU) {
+        this.logSelection(
+          selectionReason,
+          "none",
+          persistedStatus.state === "invalid" ? "login" : "import",
+        );
         return this.result(
-          "NEEDS_LOGIN",
-          "持久化会话已失效，未配置环境 MUSIC_U，需要重新登录。",
+          persistedStatus.state === "invalid"
+            ? "NEEDS_LOGIN"
+            : "NEEDS_SESSION_IMPORT",
+          persistedStatus.state === "invalid"
+            ? "持久化会话已失效，未配置环境 MUSIC_U，需要重新登录。"
+            : "当前 Cookie 不完整，未配置环境 MUSIC_U，需要导入完整会话。",
         );
       }
 
       candidateMusicU = envMusicU;
-      candidateCookie = this.mergeCookies(persistedCookie, [], candidateMusicU);
+      candidateSource = "env";
+      // 环境 token 是独立候选，不能携带旧会话的 csrf、NMTID 或其他登录字段。
+      candidateCookie = `MUSIC_U=${this.encodeCookieValue(candidateMusicU)}`;
       this.logSession(candidateCookie, "env.MUSIC_U candidate");
+      this.logSelection(selectionReason, "env", "refresh");
+    }
+
+    if (persistedStatus.state === "alive") {
+      this.logSelection("alive", "persisted", "refresh");
     }
 
     if (!candidateMusicU) {
@@ -385,6 +502,15 @@ export class CookieManager {
       );
     }
 
+    const refreshStartedAt = Date.now();
+    logDiagnostic("refresh", {
+      stage: "request",
+      candidate: candidateSource,
+      musicU: candidateMusicU ? "present" : "missing",
+      csrf: this.getCookieValueFromString(candidateCookie, "__csrf")
+        ? "present"
+        : "missing",
+    });
     try {
       const response = await NeteaseAccount.refreshCookie(
         this.getCookieValueFromString(candidateCookie, "__csrf"),
@@ -393,6 +519,12 @@ export class CookieManager {
         this.normalizeCookie(candidateCookie),
       );
       if (!response.ok) {
+        logDiagnostic("refresh", {
+          stage: "response",
+          httpStatus: response.status,
+          elapsedMs: Date.now() - refreshStartedAt,
+          result: "rejected",
+        });
         console.error(
           `> [CookieManager] 刷新被 HTTP ${response.status} 拒绝。`,
         );
@@ -411,12 +543,25 @@ export class CookieManager {
         }
         responseData = data;
       } catch {
+        logDiagnostic("refresh", {
+          stage: "response",
+          result: "invalid-json",
+          httpStatus: response.status,
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "REFRESH_RESPONSE_INVALID",
           "刷新响应不是可解析的 JSON，保留当前会话。",
         );
       }
       if (responseData.code !== 200) {
+        logDiagnostic("refresh", {
+          stage: "response",
+          result: "rejected",
+          httpStatus: response.status,
+          businessCode: responseData.code,
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         console.error(
           `> [CookieManager] 刷新业务状态=${String(responseData.code)}。`,
         );
@@ -425,6 +570,13 @@ export class CookieManager {
 
       const setCookieHeaders = this.getSetCookieHeaders(response);
       if (setCookieHeaders.length === 0) {
+        logDiagnostic("refresh", {
+          stage: "response",
+          result: "missing-cookie",
+          httpStatus: response.status,
+          businessCode: responseData.code,
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "REFRESH_RESPONSE_INVALID",
           "刷新响应缺少 Set-Cookie，保留当前会话。",
@@ -445,6 +597,15 @@ export class CookieManager {
         "__csrf",
       );
       if (!refreshedMusicU || !refreshedCsrf) {
+        logDiagnostic("refresh", {
+          stage: "response",
+          result: "incomplete-cookie",
+          httpStatus: response.status,
+          businessCode: responseData.code,
+          musicU: refreshedMusicU ? "present" : "missing",
+          csrf: refreshedCsrf ? "present" : "missing",
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "NEEDS_SESSION_IMPORT",
           "刷新响应缺少必要 Cookie，保留当前会话。",
@@ -454,12 +615,23 @@ export class CookieManager {
       this.logSession(mergedCookie, "refresh response");
       const refreshedStatus = await this.checkAccount(mergedCookie, ip);
       if (refreshedStatus.state === "unavailable") {
+        logDiagnostic("refresh", {
+          stage: "account-verification",
+          result: "unavailable",
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "REFRESH_RESPONSE_INVALID",
           "刷新后的账号校验网络异常，保留当前会话。",
         );
       }
       if (refreshedStatus.state !== "alive") {
+        logDiagnostic("refresh", {
+          stage: "account-verification",
+          result: "rejected",
+          businessCode: refreshedStatus.code,
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "NEEDS_LOGIN",
           "刷新后的会话未通过账号校验，需要重新登录。",
@@ -467,18 +639,36 @@ export class CookieManager {
       }
 
       if (!this.setCookie(mergedCookie)) {
+        logDiagnostic("refresh", {
+          stage: "save",
+          result: "failed",
+          elapsedMs: Date.now() - refreshStartedAt,
+        });
         return this.result(
           "REFRESH_RESPONSE_INVALID",
           "刷新后的会话保存失败，保留当前会话。",
         );
       }
 
+      logDiagnostic("refresh", {
+        stage: "complete",
+        result: "success",
+        httpStatus: response.status,
+        businessCode: responseData.code,
+        elapsedMs: Date.now() - refreshStartedAt,
+      });
       return this.result(
         "REFRESHED",
         "Cookie 已刷新并通过二次账号校验。",
         true,
       );
-    } catch {
+    } catch (error: unknown) {
+      logDiagnostic("refresh", {
+        stage: "request",
+        result: "network-error",
+        elapsedMs: Date.now() - refreshStartedAt,
+        ...safeErrorFields(error),
+      });
       console.error("> [CookieManager] 刷新网络异常，保留当前会话。");
       return this.result(
         "REFRESH_RESPONSE_INVALID",
@@ -509,5 +699,23 @@ export class CookieManager {
     ip: string,
   ): Promise<RefreshResult> {
     return this.refreshCookieResult(ip, true);
+  }
+
+  public static async initialize(
+    ip: string,
+    refreshOnStartup: boolean,
+  ): Promise<RefreshResult> {
+    if (refreshOnStartup) return this.checkAndRefreshCookie(ip);
+
+    const cookie = this.getCookieData()?.cookie || "";
+    const hasRequiredFields =
+      Boolean(this.getCookieValueFromString(cookie, "MUSIC_U")) &&
+      Boolean(this.getCookieValueFromString(cookie, "__csrf"));
+    if (hasRequiredFields) {
+      this.logSession(cookie, "persisted");
+      this.logSelection("alive", "persisted", "skip");
+      return this.result("SKIPPED", "已有完整会话，启动时不刷新。", false);
+    }
+    return this.refreshCookieResult(ip);
   }
 }

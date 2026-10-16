@@ -1,5 +1,25 @@
 import { SendRequest } from "../index.js";
 import { NeteaseCrypto } from "./NeteaseCrypto.js";
+import { logDiagnostic, safeErrorFields } from "../../config/env.js";
+
+class NeteaseAccountError extends Error {
+  public readonly errorCategory:
+    "http-error" | "invalid-json" | "business-error" | "malformed-response";
+  public readonly httpStatus: number;
+  public readonly businessCode?: number;
+
+  public constructor(
+    category: NeteaseAccountError["errorCategory"],
+    httpStatus: number,
+    businessCode?: number,
+  ) {
+    super("网易云账号请求失败");
+    this.name = "NeteaseAccountError";
+    this.errorCategory = category;
+    this.httpStatus = httpStatus;
+    this.businessCode = businessCode;
+  }
+}
 
 export function classifyAccount(
   data: unknown,
@@ -111,6 +131,7 @@ export class NeteaseAccount extends SendRequest {
     ip: string,
     cookie?: string,
   ): Promise<NeteaseAccountInfo> {
+    const startedAt = Date.now();
     const url = "https://music.163.com/weapi/w/nuser/account/get";
 
     const data = {
@@ -136,25 +157,66 @@ export class NeteaseAccount extends SendRequest {
       "X-Forwarded-For": ip,
     };
 
-    const response = await this.sendPost(
-      url,
-      new URLSearchParams(body),
-      headers,
-      AbortSignal.timeout(10000),
-    );
-
-    if (!response.ok) {
-      throw new Error(`账号接口 HTTP ${response.status}`);
-    }
-
+    let response: Response;
     try {
-      const responseData = await response.json();
-      if (classifyAccount(responseData) === "unavailable") {
-        throw new Error("账号接口响应结构无效");
-      }
-      return responseData as NeteaseAccountInfo;
-    } catch {
-      throw new Error("账号接口响应不可用");
+      response = await this.sendPost(
+        url,
+        new URLSearchParams(body),
+        headers,
+        AbortSignal.timeout(10000),
+      );
+    } catch (error: unknown) {
+      logDiagnostic("account-request", {
+        result: "network-error",
+        ...safeErrorFields(error),
+        elapsedMs: Date.now() - startedAt,
+      });
+      throw error;
     }
+
+    const fail = (
+      category: NeteaseAccountError["errorCategory"],
+      businessCode?: number,
+    ): never => {
+      const error = new NeteaseAccountError(
+        category,
+        response.status,
+        businessCode,
+      );
+      logDiagnostic("account-request", {
+        ...safeErrorFields(error),
+        elapsedMs: Date.now() - startedAt,
+      });
+      throw error;
+    };
+    let responseData: unknown;
+    try {
+      responseData = await response.json();
+    } catch {
+      return fail(response.ok ? "invalid-json" : "http-error");
+    }
+    const businessCode =
+      responseData &&
+      typeof responseData === "object" &&
+      typeof (responseData as { code?: unknown }).code === "number" &&
+      Number.isFinite((responseData as { code: number }).code)
+        ? (responseData as { code: number }).code
+        : undefined;
+    if (!response.ok) return fail("http-error", businessCode);
+    if (classifyAccount(responseData) === "unavailable") {
+      return fail(
+        businessCode === undefined || businessCode === 200
+          ? "malformed-response"
+          : "business-error",
+        businessCode,
+      );
+    }
+    logDiagnostic("account-request", {
+      result: classifyAccount(responseData),
+      httpStatus: response.status,
+      businessCode,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return responseData as NeteaseAccountInfo;
   }
 }

@@ -1,6 +1,5 @@
 import http from "http";
 import { URL } from "url";
-import dotenv from "dotenv";
 import { env } from "process";
 
 import { Router } from "./routes/router.js";
@@ -10,10 +9,15 @@ import { initRefreshRoute } from "./routes/refresh.js";
 import { CookieManager } from "./accountManage/netease/CookieManager.js";
 import { IpManager } from "./service/ip.js";
 import { initAccountRoute } from "./routes/account.js";
+import {
+  isTruthy,
+  logConfigDiagnostics,
+  resolvePort,
+  safeErrorFields,
+} from "./config/env.js";
 
-dotenv.config();
-
-const PORT = 9000;
+const portConfig = resolvePort(env.PORT);
+const PORT = portConfig.port;
 const HOST = "0.0.0.0";
 
 /*
@@ -83,7 +87,8 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify(
         {
           error: "Critical Error",
-          message: error instanceof Error ? error.message : "Unknown Error",
+          message: "Request failed",
+          ...safeErrorFields(error),
         },
         null,
         2,
@@ -93,19 +98,28 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, async () => {
+  const listeningAddress = server.address();
+  const listeningPort =
+    listeningAddress && typeof listeningAddress === "object"
+      ? listeningAddress.port
+      : PORT;
+  console.log(`> Server listening at http://${HOST}:${listeningPort}`);
   await IpManager.fetchRealIp();
-  const refreshOnStartup = ["true", "1", "t", "yes"].includes(
-    env.REFRESH_COOKIE_NETEASE?.trim().toLowerCase() ?? "",
+  logConfigDiagnostics(CookieManager.getCookieStoragePath(), portConfig);
+  const refreshOnStartup = isTruthy(env.REFRESH_COOKIE_NETEASE);
+  const startupResult = await CookieManager.initialize(
+    IpManager.getIp(),
+    refreshOnStartup,
   );
-
-  if (refreshOnStartup) {
-    console.log("> 启动时尝试刷新网易云 Cookie...");
-
-    await CookieManager.refreshCookie(IpManager.getIp());
-  }
-  await CookieManager.getCookie(IpManager.getIp());
-  console.log(`> Server active at http://${HOST}:${PORT}`);
   console.log(
-    `> Local Test: http://localhost:${PORT}/musicstreamlink/?platform=netease&id=431259256&quality=jymaster&vip=1`,
+    `> [Startup] session status=${startupResult.status}, success=${startupResult.success}, ` +
+      `refreshed=${startupResult.refreshed}, reason=${startupResult.message}`,
+  );
+  const address = server.address();
+  const actualPort =
+    address && typeof address === "object" ? address.port : PORT;
+  console.log(`> Server active at http://${HOST}:${actualPort}`);
+  console.log(
+    `> Local Test: http://localhost:${actualPort}/musicstreamlink/?platform=netease&id=431259256&quality=jymaster&vip=1`,
   );
 });

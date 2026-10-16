@@ -3,6 +3,7 @@
 import { Router } from "./router.js";
 import { CookieManager } from "../accountManage/netease/CookieManager.js";
 import { sendError } from "../utils/response.js";
+import { safeErrorFields } from "../config/env.js";
 
 let getIp: () => string = () => "0.0.0.0";
 
@@ -20,15 +21,10 @@ export function initRefreshRoute(ipGetter: () => string): void {
 
       return;
     } catch (innerError: unknown) {
-      const msg =
-        innerError instanceof Error
-          ? innerError.message
-          : "Unknown Internal Error";
-
       sendError(res, 500, {
         error: "Internal Error 1",
-        message: msg,
-        cause: innerError instanceof Error ? innerError.cause : undefined,
+        message: "Request failed",
+        cause: safeErrorFields(innerError),
       });
 
       return;

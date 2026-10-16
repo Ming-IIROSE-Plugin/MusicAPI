@@ -1,22 +1,35 @@
-// services/ip.ts
+import { logDiagnostic, safeErrorFields } from "../config/env.js";
 
 export class IpManager {
-  private static currentIp = "49.235.161.77";
+  private static currentIp = "127.0.0.1";
 
   static async fetchRealIp(): Promise<void> {
+    const startedAt = Date.now();
     try {
-      const res = await fetch("https://api.ip.sb/ip");
+      const res = await fetch("https://api.ip.sb/ip", {
+        signal: AbortSignal.timeout(5000),
+      });
 
       if (res.ok) {
         this.currentIp = (await res.text()).trim();
-
-        console.log(`> [System] Public IP: ${this.currentIp}`);
+        logDiagnostic("public-ip", {
+          result: "success",
+          httpStatus: res.status,
+          elapsedMs: Date.now() - startedAt,
+        });
+      } else {
+        logDiagnostic("public-ip", {
+          result: "http-error",
+          httpStatus: res.status,
+          elapsedMs: Date.now() - startedAt,
+        });
       }
-    } catch (err: unknown) {
-      console.error(
-        "> [Warning] Failed to fetch public IP:",
-        err instanceof Error ? err.message : err,
-      );
+    } catch (error: unknown) {
+      logDiagnostic("public-ip", {
+        result: "network-error",
+        elapsedMs: Date.now() - startedAt,
+        ...safeErrorFields(error),
+      });
     }
   }
 
