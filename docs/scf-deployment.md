@@ -1,5 +1,7 @@
 # SCF 部署
 
+已于 2026-10-16 开启并完成首次完整验收：[自动部署运行 38964095180](https://github.com/jingming295/MusicAPI/actions/runs/38964095180)。提交 `30d827c` 的 push 触发构建、45 项应用测试、26 项部署测试、生产包启动测试和云端更新；函数恢复 Active，云端文件内容与产物匹配，HTTP 健康检查通过。`SCF_CONFIG_MIGRATED`、`SCF_DEPLOY_ENABLED` 已启用，健康入口已配置。
+
 GitHub Actions 面向已经存在的腾讯云函数 `ap-hongkong/default/MusicAPI`，只更新代码包。工作流使用 Node 24 构建，生产 ZIP 只包含 `dist/`、`package.json`、生产依赖和可执行的 `scf_bootstrap`。`.env`、`data/`、Cookie、密钥、测试文件和开发依赖不会进入 ZIP。
 
 工作流在 `main` 分支的代码、依赖、构建、部署脚本或启动文件变化时运行，也支持 `workflow_dispatch`。部署作业始终先执行只读预检；只有仓库变量 `SCF_DEPLOY_ENABLED` 与 `SCF_CONFIG_MIGRATED` 都精确为 `true`、云端 `MUSIC_U` 非空且全部预检通过，才调用 `UpdateFunctionCode`。开关关闭时，摘要显示“代码更新 skipped”、preflight ready 和未满足条件，不会宣称已经部署。
@@ -27,4 +29,4 @@ GitHub Actions 面向已经存在的腾讯云函数 `ap-hongkong/default/MusicAP
 1. 在云端私下核对旧 `.env` 中 `MUSIC_U`、`REFRESH_COOKIE_NETEASE`、`DEBUG_NETEASE`、`NETEASE_COOKIE_FILE`、`PORT` 以及其他实际配置键。按既有含义迁移到函数 Environment；未使用的键也应确认其默认行为可接受。不要把值贴进日志、文档或 artifact。
 2. 确认 token 有效性、刷新开关、调试开关、持久 Cookie 路径与监听端口符合现有服务需求。仅有 `MUSIC_U` 字段或非空值不能证明迁移完成；脚本不会自动迁移凭证。
 3. 完成以上核对后手动设置仓库变量 `SCF_CONFIG_MIGRATED=true`，配置并核对健康入口，然后运行只读预检。配置改变后重新核对迁移状态。
-4. 预检 ready 后，最后手动启用 `SCF_DEPLOY_ENABLED=true`。当前代码就绪，实际部署仍被配置迁移与入口确认前置条件阻塞，尚未完成真实部署验收。
+4. 预检 ready 后，最后启用 `SCF_DEPLOY_ENABLED=true`。本项目已完成上述步骤；以后相关代码 push 到 main 自动执行验证与部署，纯文档变更不会触发。

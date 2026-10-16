@@ -3,7 +3,7 @@ title: GitHub Actions 自动更新现有 MusicAPI 云函数
 type: feature
 created: 2026-10-16
 status: done
-deployment_status: blocked-on-config-migration
+deployment_status: verified
 route: dispatch
 review_loop_iteration: 0
 baseline_commit: 0c57639114afac5736adb6f9e389b46ca39c22dc
@@ -43,7 +43,7 @@ context:
 
 ## Open Questions
 
-1. 线上代码包含 `.env`，而云端 Environment 无 MUSIC_U 等字段；首次替换代码前需将必要配置保存在云端环境变量。当前流水线先验证和只读预检查，部署默认受仓库变量 SCF_DEPLOY_ENABLED 控制；在配置来源解决前不更新生产代码。
+无。用户已确认环境变量迁移，只读检查验证三项配置存在，自动部署与目标 HTTP 入口验收通过。
 
 ## Code Map
 
@@ -73,9 +73,15 @@ context:
 
 ## Implementation Notes
 
+最终验收（2026-10-16）：用户确认环境变量已迁移后，运行 38961968709 验证 MUSIC_U、REFRESH_COOKIE_NETEASE、DEBUG_NETEASE 均存在于云端 Environment；启用 SCF_CONFIG_MIGRATED 与 SCF_DEPLOY_ENABLED。提交 30d827c 由 push 自动触发运行 38964095180，validate/deploy 均成功：45 项应用测试、26 项 Python 部署测试、lint、生产 ZIP 隔离启动通过；预检全部满足，UpdateFunctionCode 已执行，函数 Active、code_content_matched=true、HTTP health=passed、updated=true。现有环境变量、挂载和别名配置由代码更新接口保留。验收仅覆盖部署和 HTTP 存活，不代表网易云账号或音乐播放已重新实测。
+
+真实部署发现并修复两项差异：更新期间 GetFunctionAddress 可能暂时不可用，现限定时间重试；SCF 下载包会与上传 ZIP 原始摘要不同，现通过内存下载校验云端摘要，并逐文件核对路径、内容 SHA256 和执行权限，不能仅凭摘要变化放行。此前运行 38962092901 与 38962459364 的验收失败不等于代码未更新，最终成功运行以上述 38964095180 为准。
+
+以下为首次启用前的历史调查记录，当前状态以上述最终验收为准。
+
 实际 GitHub 验证（2026-10-16）：提交 8234ab3 的运行 38961253145 完成，Node 24 构建/lint、45 项应用测试、23 项 Python 测试、生产 ZIP 打包及解包启动测试全部通过。云端只读预检确认目标、运行时、挂载、别名和 HTTP 触发器匹配；部署门控关闭，updated=false。运行 38961253462 进一步确认旧包 .env 中存在 MUSIC_U、REFRESH_COOKIE_NETEASE、DEBUG_NETEASE，而云端环境变量不存在这些项；只输出存在性，未保存或输出值。已将目标公网 origin 配置到仓库变量 SCF_HEALTH_URL；首次 CI 在设置前启动，因此健康 URL 条件需下次重验。
 
-当前交付状态：CI/CD 实现与云端只读调查完成，首次生产更新尚未执行。剩余操作为将旧 .env 的三项配置迁移到 SCF 环境变量，确认迁移后设置 SCF_CONFIG_MIGRATED=true、SCF_DEPLOY_ENABLED=true，再执行首次部署验收。状态保留 in-progress，不能把绿色 CI 解释为已更新生产。
+首次启用前状态：CI/CD 实现与云端只读调查完成，当时仍等待配置迁移和生产验收；现已完成，见最终验收记录。
 
 2026-10-16 用户完成 GitHub workflow 授权，明确允许通过 Actions 查询腾讯云。只读检查运行 38958158656 成功：Runtime=Nodejs24.11、Type=HTTP、Status=Active、Timeout=3、InitTimeout=65、MemorySize=512、挂载 /mnt/、公网启用且配置 VPC。http 触发器绑定 $DEFAULT，别名指向 $LATEST 且无权重分流。ZIP 内有 dist/index.js、package.json、node_modules、可执行 scf_bootstrap，启动二进制 /var/lang/node24/bin/node。ZIP 中有 .env，但不读取输出其值。两个腾讯云 Secrets 已存在且鉴权成功。
 
@@ -91,7 +97,7 @@ context:
 
 ## Review Triage Log
 
-代码已实现，实际部署被配置迁移与健康入口确认阻塞。先前“未发现问题”的自审结论由以下独立审查结果替代；离线通过不代表真实部署验收通过。
+以下为实现阶段独立审查记录；配置迁移与健康入口确认已完成，真实部署结果见最终验收。
 
 | #   | 发现                                     | 处置与验证                                                                                                                     |
 | --- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
