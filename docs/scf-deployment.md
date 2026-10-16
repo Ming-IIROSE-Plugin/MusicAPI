@@ -8,13 +8,13 @@ GitHub Actions 面向已经存在的腾讯云函数 `ap-hongkong/default/MusicAP
 
 预检要求函数为 `HTTP` 类型、运行时为 `Nodejs24.11`、状态为 `Active`，存在 `/mnt/` CFS 挂载，云端 `MUSIC_U` 非空，`$DEFAULT` 别名指向 `$LATEST` 且没有流量权重，并存在绑定 `$DEFAULT` 的 HTTP 触发器。任一条件不满足都会在代码更新前失败。脚本不会调用配置、别名、触发器或存储修改接口。
 
-更新只调用一次 `UpdateFunctionCode`，参数为 ZIP、`InstallDependency=FALSE`、`Publish=FALSE`。之后脚本在有限时间内轮询函数状态和代码 SHA256，必须同时恢复为 `Active` 且 hash 匹配。实际部署必须配置仓库变量 `SCF_HEALTH_URL`。脚本递归读取该目标函数启用的 `$DEFAULT` HTTP 触发器 `TriggerDesc` 中的 HTTPS `*.tencentscf.com` URL，只接受其中发现的 origin，不接受同域后缀的其他函数地址。无法发现 URL 时阻止部署，不输出原始响应。
+更新只调用一次 `UpdateFunctionCode`，参数为 ZIP、`InstallDependency=FALSE`、`Publish=FALSE`。之后脚本在有限时间内轮询函数状态和代码 SHA256：要求函数恢复为 `Active`，并精确匹配上传 ZIP 的 hash；若服务端重新封装 ZIP，则在内存下载云端包，验证下载摘要及全部文件的路径、内容 SHA256 和执行权限与上传包一致。仅 hash 变化不能证明部署成功。实际部署必须配置仓库变量 `SCF_HEALTH_URL`。脚本递归读取该目标函数启用的 `$DEFAULT` HTTP 触发器 `TriggerDesc` 中的 HTTPS `*.tencentscf.com` URL，只接受其中发现的 origin，不接受同域后缀的其他函数地址。无法发现 URL 时阻止部署，不输出原始响应。
 
 自定义域名必须额外设置 `SCF_HEALTH_TRUSTED_ORIGIN` 为其准确 HTTPS origin，并由维护者在控制台人工确认该域名确实映射到 `ap-hongkong/default/MusicAPI` 的 `$DEFAULT` HTTP 入口。该变量是人工映射确认，不是自动发现；不能用它放行其他 `*.tencentscf.com` 主机，且仍要求发现目标触发器 URL。
 
-当前没有自动回滚或版本切流。若更新后验证失败，保留 Actions 日志中的提交、预检、hash 和状态信息，由维护者在腾讯云控制台确认现有 `$LATEST`、别名和触发器后手动恢复；不要猜测线上版本或修改挂载配置。工作流不下载或记录 `GetFunctionAddress` 的签名 URL。
+当前没有自动回滚或版本切流。若更新后验证失败，保留 Actions 日志中的提交、预检、hash 和状态信息，由维护者在腾讯云控制台确认现有 `$LATEST`、别名和触发器后手动恢复；不要猜测线上版本或修改挂载配置。工作流不会记录签名 URL，也不会落盘、解压或执行下载的云端包。
 
-代码 hash 从 `GetFunctionAddress.CodeSha256` 读取，十六进制统一为小写，Base64 保持大小写；`GetFunction` 仅用于状态与配置校验。云端 hash 与上传 ZIP SHA256 相等的实际行为仍需首次真实部署验证，当前只有离线模拟证据，不代表线上更新已通过。触发器响应要求 `Type=http`、`Enable=1`；路由配置只接受已知的 `AdditionalVersionWeights`、`AddtionVersionMatchs` 空数组，非空或未知字段会阻止部署。
+代码 hash 从 `GetFunctionAddress.CodeSha256` 读取，十六进制统一为小写，Base64 保持大小写；比较时按 32 字节摘要识别编码。实测云端包摘要与上传 ZIP 摘要不同，因此增加完整文件内容校验以兼容重新封装；`GetFunction` 仅用于状态与配置校验。触发器响应要求 `Type=http`、`Enable=1`；路由配置只接受已知的 `AdditionalVersionWeights`、`AddtionVersionMatchs` 空数组，非空或未知字段会阻止部署。
 
 打包器在临时目录重新编译，并按 lockfile 安装生产依赖。原始及新生成的 dist 只接受 `.js`、`.d.ts`、`.js.map`，拒绝符号链接、隐藏文件和运行数据目录；依赖树中的符号链接也会被拒绝。压缩 ZIP 限制为 3 MiB，这是本项目为 Base64 内联请求预留空间的保守上限，并非腾讯云的官方配额声明；打包时与更新前均校验。
 

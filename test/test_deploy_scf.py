@@ -27,6 +27,17 @@ class FakeClient:
         return response() if callable(response) else response
 
 
+def fixture_zip(compression=zipfile.ZIP_STORED, changed=False):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression) as bundle:
+        bundle.writestr("dist/index.js", "changed" if changed else "synthetic")
+        bundle.writestr("package.json", "{}")
+        info = zipfile.ZipInfo("scf_bootstrap")
+        info.external_attr = 0o100755 << 16
+        bundle.writestr(info, "#!/bin/bash\n")
+    return output.getvalue()
+
+
 def valid_responses(hash_value="0" * 64):
     return {
         "GetFunction": {
@@ -204,8 +215,10 @@ class DeploymentTests(unittest.TestCase):
     def test_health_failure_after_update_never_emits_success(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "bundle.zip"
-            archive.write_bytes(b"zip")
-            responses = valid_responses(hashlib.sha256(b"zip").hexdigest())
+            archive.write_bytes(fixture_zip())
+            responses = valid_responses(
+                hashlib.sha256(archive.read_bytes()).hexdigest()
+            )
             responses["UpdateFunctionCode"] = {}
             client = FakeClient(responses)
             output = io.StringIO()
@@ -314,6 +327,49 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn("must-not-log", output.getvalue())
         self.assertNotIn("UpdateFunctionCode", [name for name, _ in client.calls])
 
+    def test_wait_accepts_server_repacked_hash_after_update(self):
+        original = fixture_zip()
+        repacked = fixture_zip(zipfile.ZIP_DEFLATED)
+        self.assertNotEqual(
+            hashlib.sha256(original).digest(), hashlib.sha256(repacked).digest()
+        )
+        responses = valid_responses(hashlib.sha256(repacked).hexdigest())
+        responses["GetFunctionAddress"]["Url"] = (
+            "https://code.cos.ap-hongkong.myqcloud.com/code.zip?sign=DO-NOT-LOG"
+        )
+        client = FakeClient(responses)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = repacked
+        with patch.object(deploy, "urlopen", return_value=response):
+            result = deploy.wait_for_code(
+                client,
+                {hashlib.sha256(original).hexdigest()},
+                client.call,
+                expected_manifest=deploy.archive_manifest(original),
+            )
+        self.assertEqual(result["Status"], "Active")
+
+    def test_changed_cloud_content_never_passes_manifest_check(self):
+        client = FakeClient(valid_responses("2" * 64))
+        with (
+            patch.object(
+                deploy,
+                "deployed_manifest",
+                return_value=deploy.archive_manifest(fixture_zip(changed=True)),
+            ),
+            patch.object(deploy.time, "monotonic", side_effect=[0, 0, 2, 2]),
+            patch.object(deploy.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(deploy.DeploymentError, "ReadinessTimeout"):
+                deploy.wait_for_code(
+                    client,
+                    {"1" * 64},
+                    client.call,
+                    timeout=1,
+                    expected_manifest=deploy.archive_manifest(fixture_zip()),
+                )
+
     def test_bad_health_and_oversize_prevent_update(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "bundle.zip"
@@ -351,7 +407,7 @@ class DeploymentTests(unittest.TestCase):
             patch.dict(os.environ, {"SCF_HEALTH_URL": "https://abc.tencentscf.com/"}),
         ):
             archive = Path(directory) / "bundle.zip"
-            archive.write_bytes(b"zip")
+            archive.write_bytes(fixture_zip())
             with self.assertRaises(RuntimeError):
                 deploy.deploy(client, archive, client.call, enabled=True)
         self.assertEqual(
@@ -416,7 +472,7 @@ class DeploymentTests(unittest.TestCase):
     def test_update_is_single_call_and_waits_for_hash(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "bundle.zip"
-            archive.write_bytes(b"zip-content")
+            archive.write_bytes(fixture_zip())
             expected = base64.b64encode(
                 hashlib.sha256(archive.read_bytes()).digest()
             ).decode()

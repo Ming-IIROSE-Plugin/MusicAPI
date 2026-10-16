@@ -10,15 +10,18 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import re
 import time
-from pathlib import Path
+import stat
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 TARGET = {"FunctionName": "MusicAPI", "Namespace": "default"}
@@ -231,9 +234,79 @@ def code_hash(client: Any, call: Call) -> str:
     return value.lower() if re.fullmatch(r"[a-fA-F0-9]{64}", value) else value
 
 
+def hash_identity(value: str) -> bytes:
+    if re.fullmatch(r"[a-fA-F0-9]{64}", value):
+        return bytes.fromhex(value)
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise DeploymentError("InvalidCodeHash") from error
+    if len(decoded) != 32:
+        raise DeploymentError("InvalidCodeHash")
+    return decoded
+
+
 def package_hash(path: Path) -> tuple[str, str]:
     digest = hashlib.sha256(path.read_bytes()).digest()
     return base64.b64encode(digest).decode("ascii"), digest.hex()
+
+
+def archive_manifest(content: bytes) -> dict[str, tuple[str, bool]]:
+    """Compare deployed files without extracting or executing cloud code."""
+    manifest = {}
+    with zipfile.ZipFile(io.BytesIO(content)) as bundle:
+        total = 0
+        for item in bundle.infolist():
+            name = item.filename
+            path = PurePosixPath(name)
+            mode = item.external_attr >> 16
+            total += item.file_size
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or "\\" in name
+                or stat.S_ISLNK(mode)
+                or total > 64 * 1024 * 1024
+            ):
+                raise DeploymentError("UnsafeCodeArchive")
+            if item.is_dir():
+                continue
+            if name in manifest:
+                raise DeploymentError("DuplicateArchiveEntry")
+            manifest[name] = (
+                hashlib.sha256(bundle.read(item)).hexdigest(),
+                bool(mode & 0o111),
+            )
+    if not {"dist/index.js", "package.json", "scf_bootstrap"} <= manifest.keys():
+        raise DeploymentError("IncompleteCodeArchive")
+    return manifest
+
+
+def deployed_manifest(client: Any, call: Call, expected_hash: str) -> dict:
+    data = read_api(client, "GetFunctionAddress", {"Qualifier": "$LATEST"}, call)
+    url = data.get("Url", "")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or not parsed.hostname.endswith(".myqcloud.com")
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 443)
+    ):
+        raise DeploymentError("InvalidCodeDownloadUrl")
+    url = parsed._replace(scheme="https").geturl()
+    # Signed URL and archive remain in memory and are never logged or persisted.
+    try:
+        with urlopen(url, timeout=20) as response:
+            content = response.read(50 * 1024 * 1024 + 1)
+        if len(content) > 50 * 1024 * 1024:
+            raise DeploymentError("CodeDownloadSizeLimit")
+        if hashlib.sha256(content).digest() != hash_identity(expected_hash):
+            raise DeploymentError("CodeDownloadHashChanged")
+        return archive_manifest(content)
+    except Exception:
+        raise DeploymentError("CodeArchiveVerificationFailed") from None
 
 
 def wait_for_code(
@@ -242,9 +315,11 @@ def wait_for_code(
     call: Call = sdk_call,
     timeout: float = 180,
     interval: float = 5,
+    expected_manifest: dict | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     latest: dict[str, Any] = {}
+    checked_hash = None
     while time.monotonic() <= deadline:
         latest = read_api(client, "GetFunction", {"ShowCode": "FALSE"}, call)
         try:
@@ -258,9 +333,29 @@ def wait_for_code(
                 "readiness",
                 {"status": latest.get("Status"), "code_address_pending": True},
             )
-        if latest.get("Status") == "Active" and current_hash in expected_hashes:
-            emit("readiness", {"status": "Active", "code_hash_matched": True})
-            return latest
+        if latest.get("Status") == "Active":
+            exact_match = current_hash in expected_hashes
+            content_match = False
+            if (
+                not exact_match
+                and expected_manifest is not None
+                and current_hash
+                and current_hash != checked_hash
+            ):
+                content_match = (
+                    deployed_manifest(client, call, current_hash) == expected_manifest
+                )
+                checked_hash = current_hash
+            if exact_match or content_match:
+                emit(
+                    "readiness",
+                    {
+                        "status": "Active",
+                        "code_hash_matched": exact_match,
+                        "code_content_matched": content_match,
+                    },
+                )
+                return latest
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
     emit("readiness", {"status": latest.get("Status"), "code_hash_matched": False})
     raise DeploymentError("ReadinessTimeout")
@@ -361,6 +456,7 @@ def deploy(
     if not content or len(content) > MAX_ARCHIVE_BYTES:
         raise DeploymentError("PackageSizeLimit")
     digest = hashlib.sha256(content).digest()
+    manifest = archive_manifest(content)
     expected_b64, expected_hex = base64.b64encode(digest).decode("ascii"), digest.hex()
     old_hash = preflight_result["old_code_sha256"]
     response = api(
@@ -382,7 +478,12 @@ def deploy(
             "expected_code_sha256": expected_b64,
         },
     )
-    wait_for_code(client, {expected_b64, expected_hex}, call)
+    wait_for_code(
+        client,
+        {expected_b64, expected_hex},
+        call,
+        expected_manifest=manifest,
+    )
     health_check(
         health_url, trusted_origin, origins=preflight_result["_health_origins"]
     )
