@@ -1,0 +1,22 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+data/
+*.log
+*.tmp
+
+# Independent third-party reference checkout
+/api-enhanced/
+
+# Local BMAD state and generated workflow snapshots
+/_bmad/render/
+/_bmad/config.user.toml
+**/__pycache__/
+*.pyc
