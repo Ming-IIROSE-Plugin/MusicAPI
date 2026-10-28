@@ -11,10 +11,14 @@ const BASE_DATA_PATH = existsSync("/mnt")
 const NORMAL_EXPIRE = 45 * 60 * 1000; // 普通资源 45 分钟
 const VIP_EXPIRE = 20 * 60 * 1000; // VIP 资源 20 分钟
 const PROBE_TIMEOUT = 3000; // 单次探测超时
-const REVERIFY_INTERVAL = 60 * 1000; // 同一地址 60 秒内不重复探测
+const REVERIFY_INTERVAL = 15 * 1000; // 同一地址 15 秒内不重复探测
+/** 这些状态码已足以判定地址失效，不再用 GET 复核 */
+const CONCLUSIVE_FAILURE = new Set([401, 403, 404, 410, 451]);
 
 /** 最近一次探测的时间，避免同一地址被反复校验 */
 const lastVerifiedAt = new Map<string, number>();
+/** 同一地址的并发探测合并成一次请求 */
+const inFlightProbes = new Map<string, Promise<MediaProbeResult>>();
 
 /**
  * 探测结果
@@ -25,6 +29,22 @@ const lastVerifiedAt = new Map<string, number>();
 export interface MediaProbeResult {
   playable: boolean;
   reachable: boolean;
+}
+
+/** 合并同一地址的并发探测，播放器连打请求时只发一次 HEAD */
+function withInFlight(
+  url: string,
+  run: () => Promise<MediaProbeResult>,
+): Promise<MediaProbeResult> {
+  const existing = inFlightProbes.get(url);
+  if (existing) return existing;
+
+  const task = run().finally(() => {
+    inFlightProbes.delete(url);
+  });
+
+  inFlightProbes.set(url, task);
+  return task;
 }
 
 function buildCachePath(platform: string, id: string, quality: string): string {
@@ -85,35 +105,47 @@ function probe(url: string, method: "HEAD" | "GET"): Promise<number | null> {
 /**
  * 探测媒体地址是否仍可播放
  *
- * 先 HEAD，失败再用 GET Range 复核（部分 CDN 不支持 HEAD）。
- * 状态码 < 400 视为可用；403/404/410 等视为失效
+ * 先 HEAD；只有 HEAD 结论不可信（不支持 HEAD、5xx、无响应）时才用
+ * GET Range 复核，省一次请求。
+ * 状态码 < 400 视为可用；403/404/410 视为失效
  * （网易云 CDN 的过期地址返回 403 + x-auth-msg: expired url）。
  */
 export async function probeMediaUrl(url: string): Promise<MediaProbeResult> {
-  const headStatus = await probe(url, "HEAD");
-  if (headStatus !== null && headStatus > 0 && headStatus < 400) {
-    return { playable: true, reachable: true };
-  }
+  return withInFlight(url, async () => {
+    const headStatus = await probe(url, "HEAD");
+    if (headStatus !== null && headStatus > 0 && headStatus < 400) {
+      return { playable: true, reachable: true };
+    }
 
-  const getStatus = await probe(url, "GET");
-  if (getStatus !== null && getStatus > 0 && getStatus < 400) {
-    return { playable: true, reachable: true };
-  }
+    // HEAD 已给出明确否定，无需再花一次请求
+    if (headStatus !== null && CONCLUSIVE_FAILURE.has(headStatus)) {
+      logDiagnostic("media-probe", {
+        result: "unplayable",
+        headStatus,
+      });
+      return { playable: false, reachable: true };
+    }
 
-  const reachable = headStatus !== null || getStatus !== null;
-  logDiagnostic("media-probe", {
-    result: reachable ? "unplayable" : "unreachable",
-    headStatus: headStatus ?? undefined,
-    getStatus: getStatus ?? undefined,
+    const getStatus = await probe(url, "GET");
+    if (getStatus !== null && getStatus > 0 && getStatus < 400) {
+      return { playable: true, reachable: true };
+    }
+
+    const reachable = headStatus !== null || getStatus !== null;
+    logDiagnostic("media-probe", {
+      result: reachable ? "unplayable" : "unreachable",
+      headStatus: headStatus ?? undefined,
+      getStatus: getStatus ?? undefined,
+    });
+
+    return { playable: false, reachable };
   });
-
-  return { playable: false, reachable };
 }
 
 /**
  * 读取缓存
  *
- * 命中后仍会校验地址可用性（同址 60 秒内跳过）。
+ * 命中后仍会校验地址可用性（同址 15 秒内跳过）。
  * 明确失效（403/404 等）时删除缓存并返回 null，交由上层重新请求；
  * 网络异常导致无法判断时保留缓存，避免误删。
  */
